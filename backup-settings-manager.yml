@@ -27,7 +27,7 @@ Parameters:
   pStackBinaryURL:
     Description: The URL for the StackBinary Zip File
     Type: String    
-    Default: 'https://observer-solution-artefacts.s3.us-west-2.amazonaws.com/backup-settings-manager/BackupSettingsManager.zip'
+    Default: 'https://{S3 URL}/BackupSettingsManager.zip'
 
 Resources:
   LocalCacheBucket:
