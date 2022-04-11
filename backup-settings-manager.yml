@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template allow AWS Backup services to be opt in or out as required. Using Stacksets this can be deployed to multiple accounts.
+Parameters:
+  pAffectedRegions: 
+    Description: A CSV list of the AWS Regions or a Single Value of All
+    Type: String
+    Default: All
+
+  pResourceTypeOptIn: 
+    Description: A CSV list of the AWS Backup Supported Resource Types (Aurora,DocumentDB,DynamoDB,EBS,EC2,EFS,FSx,Neptune,RDS,Storage Gateway,VirtualMachine) or a Single Value of All
+    Type: String
+    Default: 'Aurora,DocumentDB,DynamoDB,EBS,EC2,EFS,FSx,Neptune,RDS,Storage Gateway,VirtualMachine' 
+    
+  pResourceTypeManagement: 
+    Description: A CSV list of the AWS Backup Supported ResourceTypeManagement (DynamoDB) or a Single Value of All. EFS is not Allowed.
+    Type: String
+    Default: 'DynamoDB'
+    
+  pServiceAction: 
+    Description: Whether to Enable or Disable the Resource Types (pResourceTypeOptIn) and ResourceTypeManagement (pResourceTypeManagement) mentioned in the Region (pAffectedRegions) mentioned
+    Type: String
+    Default: Enable
+    AllowedValues:
+      - Enable
+      - Disable
+
+  pStackBinaryURL:
+    Description: The URL for the StackBinary Zip File
+    Type: String    
+    Default: 'https://observer-solution-artefacts.s3.us-west-2.amazonaws.com/backup-settings-manager/BackupSettingsManager.zip'
+
+Resources:
+  LocalCacheBucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true      
+  CleanupLocalCacheBucketOnDelete:
+    Type: Custom::CleanupBucket
+    Properties:
+      ServiceToken: !GetAtt GlobalCfnCodeReplicatorLambda.Arn
+      S3BucketToCleanup: !Ref LocalCacheBucket 
+
+  CopySolutionToLocalCacheBucket:
+    Type: Custom::ReplicateSolutionBinaries
+    Properties:
+      ServiceToken: !GetAtt GlobalCfnCodeReplicatorLambda.Arn
+      SolutionDestinationBucket: !Ref LocalCacheBucket
+      SolutionURL: !Ref pStackBinaryURL
+
+  GlobalCfnCodeReplicatorLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W89
+              reason: "Custom resource deployed in default VPC"
+            - id: W92
+              reason: "ReservedConcurrentExecutions not needed since this function runs once when CloudFormation deploys"    
+    Properties:
+      Code:
+        ZipFile: |-
+          #!/usr/bin/env python
+          # -*- coding: utf-8 -*-
+          import json
+          import boto3
+          import urllib3
+          import os
+          import shutil
+          from urllib.parse import urlparse
+          physical_resource_id = 'GlobalCfnCodeReplicator'  
+          def process_bucket_cleanup_request(bucket_name):
+              print(f"process_bucket_cleanup_request starting for bucket_name : {bucket_name}")
+              s3 = boto3.resource('s3')
+              bucket_to_delete = s3.Bucket(bucket_name)
+              response = bucket_to_delete.objects.all().delete()
+              print(f"process_bucket_cleanup_request all object delete done. Response : {response}")
+        
+          def download_url(url, save_path):
+            c = urllib3.PoolManager()
+            with c.request('GET',url, preload_content=False) as resp, open(save_path, 'wb') as out_file:
+                shutil.copyfileobj(resp, out_file)
+            resp.release_conn()
+            
+          def lambda_handler(event, context):
+            try:
+                print(f'Handling event : {event}')
+                request_type = event.get('RequestType')              
+                solution_url = event['ResourceProperties'].get('SolutionURL')
+                solution_bucket = event['ResourceProperties'].get('SolutionDestinationBucket')
+                response_data = {
+                    'RequestType': request_type,
+                    'SolutionURL' : solution_url,
+                    'SolutionDestinationBucket' : solution_bucket
+                }
+                if request_type == 'Create' or request_type == 'Update':
+                    if solution_url:
+                        print(f'downloading file from : {solution_url}')
+                        a = urlparse(solution_url)
+                        original_file_name = os.path.basename(a.path)
+                        temp_file_name = '/tmp/'+original_file_name
+                        download_url(solution_url,temp_file_name)
+                        file_size = (os.stat(temp_file_name).st_size / 1024)
+                        print(f'Downloaded report to File : {temp_file_name} , Size : {file_size}')
+                        #Upload this to the Bucket
+                        s3_client = boto3.client('s3')
+                        print(f"uploading payload to : {solution_bucket} at {original_file_name}")
+                        extraArgsForUpload = {'ACL':'bucket-owner-full-control', 'Tagging':'Source=StackBinaryURL'}
+                        s3_client.upload_file(Filename=temp_file_name, Bucket=solution_bucket, Key=original_file_name,ExtraArgs=extraArgsForUpload)
+                elif request_type == 'Delete':
+                    solution_bucket = event['ResourceProperties'].get('S3BucketToCleanup')
+                    if solution_bucket:
+                        process_bucket_cleanup_request(solution_bucket)
+                    
+                send(event, context, 'SUCCESS', response_data, physical_resource_id)
+            except Exception as e:
+                print(f'{e}')
+                send(event, context, 'FAILED', response_data, physical_resource_id)
+          def send(event, context, response_status, response_data, physical_resource_id, no_echo=False):
+            http = urllib3.PoolManager()
+            response_url = event['ResponseURL']
+            json_response_body = json.dumps({
+                'Status': response_status,
+                'Reason': f'See the details in CloudWatch Log Stream: {context.log_stream_name}',
+                'PhysicalResourceId': physical_resource_id,
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'NoEcho': no_echo,
+                'Data': response_data
+            }).encode('utf-8')
+            headers = {
+                'content-type': '',
+                'content-length': str(len(json_response_body))
+            }
+            try:
+                http.request('PUT', response_url,
+                             body=json_response_body, headers=headers)
+            except Exception as e:  # pylint: disable = W0703
+                print(e)
+      Description: Copy Solutions Binary to Local Cache Bucket
+      Handler: index.lambda_handler
+      Role : !GetAtt BackupSettingsManagerRole.Arn
+      Runtime: python3.7
+      Timeout: 300
+      
+  BackupSettingsManagerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CopySolutionToLocalCacheBucket
+    Properties:
+      FunctionName: BackupSettingsManager
+      Description: Lambda function to deploy AWS Backup Settings.
+      Handler: BackupSettingsManager.lambda_handler
+      Code:
+        S3Bucket: !Ref LocalCacheBucket
+        S3Key: 'BackupSettingsManager.zip'
+      Environment:
+        Variables:
+          BACKUP_ALL_SETTINGS_TYPE : 'All'
+      Role: !GetAtt BackupSettingsManagerRole.Arn
+      Runtime: python3.8
+      MemorySize: 256
+      Timeout: 300
+
+  BackupSettingsManagerRole:
+    Type: 'AWS::IAM::Role'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role should not allow * resource on its permissions policy
+          - id: F3
+            reason: IAM role should not allow * resource on its permissions policy
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+      - PolicyName: AssumeLambdaRole
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: '*'
+      - PolicyName: BackupPermissions
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - backup:DescribeRegionSettings
+              - backup:UpdateRegionSettings
+              - backup:GetSupportedResourceTypes
+              - ec2:DescribeRegions
+            Resource: '*'            
+      - PolicyName: S3Permissions
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: 
+              - !Sub 'arn:${AWS::Partition}:s3:::${LocalCacheBucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${LocalCacheBucket}'
+              
+  ManageAWSBackupSettings:
+    Type: Custom::managenotifications
+    Properties:
+      ServiceToken: !GetAtt BackupSettingsManagerLambda.Arn
+      AffectedRegions: !Ref pAffectedRegions
+      ResourceTypeOptIn: !Ref pResourceTypeOptIn
+      ResourceTypeManagement: !Ref pResourceTypeManagement
+      ServiceAction: !Ref pServiceAction      
